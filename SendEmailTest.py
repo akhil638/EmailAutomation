@@ -5,6 +5,7 @@ import random
 import os
 import logging
 from datetime import datetime
+import math
 
 # --- Campaign Configurations ---
 CAMPAIGNS = [
@@ -18,8 +19,20 @@ CAMPAIGNS = [
             r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Medical Devices\Followup2.oft",
             r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Medical Devices\Followup3.oft",
         ],
-        "delays": [0, 3, 3, 3],  # days before each followup (0 for initial)
+        "delays": [0, 3, 4, 5],  # days before each followup (0 for initial)
     },
+    # {
+    #     "campaign_name": "Mendix",
+    #     "excel_file_path": r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Mendix\Mendix Campaign Sheet Test.xlsx",
+    #     "sheet_name": "Cleaned Source",
+    #     "email_templates": [
+    #         r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Mendix\Mendix Email Templates\0.Mendix Initial Email.oft",
+    #         r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Mendix\Mendix Email Templates\1.Mendix First Follwoup.oft",
+    #         r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Mendix\Mendix Email Templates\2.Mendix First Followup.oft",
+    #         r"C:\Users\z004m1jf\OneDrive - Siemens AG\Documents\4. Archives\Akhil Verma\Outreach\Mendix\Mendix Email Templates\3.Mendix First Followup.oft",
+    #     ],
+    #     "delays": [0, 3, 4, 5], #days before each follwoup (0 for initial)
+    # },
     # Add more campaigns as needed
 ]
 
@@ -90,7 +103,11 @@ def send_outlook_email_from_template(template_path, recipient_email, subject, pl
                 logging.debug(f"Using {body_type_used} for replacements for {recipient_email}.")
                 replacements_made = 0
                 for placeholder, value in placeholder_data.items():
-                    replacement_value = str(value) if value is not None else ''
+                    # Replace NaN or None with empty string
+                    if value is None or (isinstance(value, float) and math.isnan(value)):
+                        replacement_value = ''
+                    else:
+                        replacement_value = str(value)
                     if placeholder in body_content:
                         body_content = body_content.replace(placeholder, replacement_value)
                         replacements_made += 1
@@ -162,8 +179,19 @@ def send_followup_as_reply(recipient_email, subject, placeholder_data, followup_
             return False
 
         # Replace placeholders
+        #logging.debug(f"Template body before replacement: {template_body}")
         for placeholder, value in placeholder_data.items():
-            template_body = template_body.replace(placeholder, str(value) if value is not None else '')
+            # Replace NaN or None with empty string
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                replacement_value = ''
+            else:
+                replacement_value = str(value)
+            # Replace plain placeholder
+            template_body = template_body.replace(placeholder, replacement_value)
+            # Replace HTML-wrapped placeholder (for Word spellcheck tags)
+            html_placeholder = f"[<span class=SpellE>{placeholder.strip('[]')}</span>]"
+            template_body = template_body.replace(html_placeholder, replacement_value)
+        #logging.debug(f"Template body after replacement: {template_body}")
 
         # Insert the follow-up template above the original message
         if is_html and hasattr(reply, 'HTMLBody'):
@@ -381,14 +409,76 @@ def get_all_eligible_followups(dfs, campaigns, today_str):
                         continue
     return followups
 
-# --- Round Robin Send Function ---
+def get_all_eligible_initials_per_campaign(dfs, campaigns, today_str):
+    initials_per_campaign = []
+    for i, (df, campaign) in enumerate(zip(dfs, campaigns)):
+        campaign_initials = []
+        for idx, row in df.iterrows():
+            current_status = row.get(STATUS_COLUMN, '')
+            last_sent_str = row.get(LAST_SENT_DATE_COLUMN, '')
+            if current_status == 'Reply Received':
+                continue
+            if last_sent_str and str(last_sent_str).startswith(today_str):
+                continue
+            if not current_status or pd.isna(current_status):
+                email_address = row.get(EMAIL_COLUMN, '')
+                subject = row.get(SUBJECT_COLUMN, '')
+                template_idx = 0
+                placeholder_values = {ph: row.get(col, '') for ph, col in PLACEHOLDERS.items()}
+                campaign_initials.append((i, idx, email_address, subject, template_idx, placeholder_values))
+        initials_per_campaign.append(campaign_initials)
+    return initials_per_campaign
+
+def get_all_eligible_followups_per_campaign(dfs, campaigns, today_str):
+    followups_per_campaign = []
+    for i, (df, campaign) in enumerate(zip(dfs, campaigns)):
+        campaign_followups = []
+        for idx, row in df.iterrows():
+            current_status = row.get(STATUS_COLUMN, '')
+            last_sent_str = row.get(LAST_SENT_DATE_COLUMN, '')
+            current_followup = row.get(FOLLOWUP_COLUMN, 0)
+            if current_status == 'Reply Received':
+                continue
+            if last_sent_str and str(last_sent_str).startswith(today_str):
+                continue
+            if current_status == 'Sent' and current_followup < len(campaign["email_templates"]) - 1:
+                if last_sent_str:
+                    try:
+                        last_sent_date = datetime.strptime(last_sent_str, '%Y-%m-%d %H:%M:%S')
+                        days_since_last = (datetime.now() - last_sent_date).days
+                        delay_days = campaign["delays"][current_followup + 1]
+                        if days_since_last < delay_days:
+                            continue
+                        template_idx = current_followup + 1
+                        email_address = row.get(EMAIL_COLUMN, '')
+                        subject = row.get(SUBJECT_COLUMN, '')
+                        placeholder_values = {ph: row.get(col, '') for ph, col in PLACEHOLDERS.items()}
+                        campaign_followups.append((i, idx, email_address, subject, template_idx, placeholder_values))
+                    except Exception:
+                        continue
+        followups_per_campaign.append(campaign_followups)
+    return followups_per_campaign
+
+def interleave_round_robin(lists, limit):
+    """
+    Interleave lists in round robin fashion up to 'limit' total items.
+    """
+    result = []
+    pointers = [0] * len(lists)
+    while len(result) < limit:
+        added = False
+        for i, l in enumerate(lists):
+            if pointers[i] < len(l):
+                result.append(l[pointers[i]])
+                pointers[i] += 1
+                if len(result) >= limit:
+                    break
+                added = True
+        if not added:
+            break
+    return result
 
 def round_robin_send_dynamic_quota(campaigns, dfs, emails_sent_today, daily_limit, initials_quota, followups_quota, prioritize='followups'):
-    """
-    Sends up to initials_quota initial emails and up to followups_quota follow-ups,
-    but will use any leftover quota for the other category if needed, up to daily_limit.
-    You can prioritize 'initials' or 'followups' for which to send first.
-    """
     today_str = datetime.now().strftime('%Y-%m-%d')
 
     initials_sent = count_initials_sent_today(dfs)
@@ -399,24 +489,29 @@ def round_robin_send_dynamic_quota(campaigns, dfs, emails_sent_today, daily_limi
     followups_left = max(0, followups_quota - followups_sent)
     total_left = daily_limit - emails_sent_today
 
-    initials = get_all_eligible_initials(dfs, campaigns, today_str)[:initials_left]
-    followups = get_all_eligible_followups(dfs, campaigns, today_str)[:followups_left]
+    initials_per_campaign = get_all_eligible_initials_per_campaign(dfs, campaigns, today_str)
+    followups_per_campaign = get_all_eligible_followups_per_campaign(dfs, campaigns, today_str)
+
+    initials = interleave_round_robin(initials_per_campaign, initials_left)
+    followups = interleave_round_robin(followups_per_campaign, followups_left)
 
     # If quota not filled, use leftover for the other category
     if prioritize == 'initials':
-        # Send initials first, then fill with followups
         slots_left = total_left - len(initials)
         if slots_left > 0:
-            more_followups = get_all_eligible_followups(dfs, campaigns, today_str)[followups_left:followups_left+slots_left]
+            more_followups = interleave_round_robin(
+                [l[followups_left:] for l in followups_per_campaign], slots_left
+            )
             followups += more_followups
     else:
-        # Send followups first, then fill with initials
         slots_left = total_left - len(followups)
         if slots_left > 0:
-            more_initials = get_all_eligible_initials(dfs, campaigns, today_str)[initials_left:initials_left+slots_left]
+            more_initials = interleave_round_robin(
+                [l[initials_left:] for l in initials_per_campaign], slots_left
+            )
             initials += more_initials
 
-    # Interleave for round robin effect
+    # Interleave initials and followups for round robin effect
     combined = []
     if prioritize == 'initials':
         max_len = max(len(initials), len(followups))
